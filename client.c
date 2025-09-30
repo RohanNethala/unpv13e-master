@@ -1,78 +1,96 @@
+// ...existing code...
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <fcntl.h>
+#include <sys/select.h>
 #include <errno.h>
 
-#define MAXLINE 1024
-#define SERVER_PORT 12345
-
-void handle_post(int sockfd, const char *message) {
-    char buffer[MAXLINE];
-    snprintf(buffer, sizeof(buffer), "POST %s", message);
-    send(sockfd, buffer, strlen(buffer), 0);
-}
-
-void handle_get(int sockfd) {
-    char buffer[MAXLINE];
-    send(sockfd, "GET", 3, 0);
-    int n = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-    if (n > 0) {
-        buffer[n] = '\0';
-        printf("Messages:\n%s\n", buffer);
-    } else {
-        perror("recv");
-    }
-}
+#define MAXLINE 2048
+#define SHUTDOWN_TOKEN "SERVER_SHUTDOWN\n"
 
 int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(1);
+    }
+
+    const char *server_ip = "127.0.0.1";
+    int port = atoi(argv[1]);
     int sockfd;
     struct sockaddr_in servaddr;
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <server_ip>\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(SERVER_PORT);
-    if (inet_pton(AF_INET, argv[1], &servaddr.sin_addr) <= 0) {
+    servaddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, server_ip, &servaddr.sin_addr) <= 0) {
         perror("inet_pton");
-        close(sockfd);
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
     if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
         perror("connect");
-        close(sockfd);
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
-    char command[MAXLINE];
-    while (1) {
-        printf("Enter command (POST <message> / GET / EXIT): ");
-        fgets(command, sizeof(command), stdin);
-        command[strcspn(command, "\n")] = 0; // Remove newline
+    fd_set rset;
+    char sendbuf[MAXLINE], recvbuf[MAXLINE];
 
-        if (strncmp(command, "POST", 4) == 0) {
-            handle_post(sockfd, command + 5);
-        } else if (strcmp(command, "GET") == 0) {
-            handle_get(sockfd);
-        } else if (strcmp(command, "EXIT") == 0) {
+    FD_ZERO(&rset);
+
+    for (;;) {
+        FD_SET(STDIN_FILENO, &rset);
+        FD_SET(sockfd, &rset);
+        int maxfd = sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO;
+
+        int nready = select(maxfd + 1, &rset, NULL, NULL, NULL);
+        if (nready < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
             break;
-        } else {
-            printf("Invalid command. Please use POST, GET, or EXIT.\n");
+        }
+
+        if (FD_ISSET(sockfd, &rset)) {
+            ssize_t n = recv(sockfd, recvbuf, sizeof(recvbuf)-1, 0);
+            if (n <= 0) {
+                /* server closed connection or error */
+                printf("Server closed connection\n");
+                close(sockfd);
+                exit(0);
+            }
+            recvbuf[n] = '\0';
+
+            /* If server sent shutdown token, print message and exit */
+            if (strcmp(recvbuf, SHUTDOWN_TOKEN) == 0 ||
+                (n >= (ssize_t)strlen(SHUTDOWN_TOKEN) && strncmp(recvbuf, SHUTDOWN_TOKEN, strlen(SHUTDOWN_TOKEN)) == 0)) {
+                printf("Server closed connection\n");
+                close(sockfd);
+                exit(0);
+            }
+
+            /* Otherwise print whatever server sent (GET response or broadcasted posts) */
+            fputs(recvbuf, stdout);
+            fflush(stdout);
+        }
+
+        if (FD_ISSET(STDIN_FILENO, &rset)) {
+            if (fgets(sendbuf, sizeof(sendbuf), stdin) == NULL) {
+                /* EOF on stdin: close and exit */
+                close(sockfd);
+                exit(0);
+            }
+            /* send user input to server */
+            size_t len = strlen(sendbuf);
+            if (len > 0) {
+                ssize_t s = send(sockfd, sendbuf, len, 0);
+                (void)s;
+            }
         }
     }
 
