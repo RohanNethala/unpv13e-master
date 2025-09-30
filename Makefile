@@ -1,7 +1,7 @@
 CC = clang
 CFLAGS = -Wall -g
-SERVER_SRC = src/server.c
-CLIENT_SRC = src/client.c
+SERVER_SRC = server.c
+CLIENT_SRC = client.c
 EXEC_SERVER = server
 EXEC_CLIENT = client
 
