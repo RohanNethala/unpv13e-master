@@ -1,4 +1,4 @@
-CC = gcc
+CC = clang
 CFLAGS = -Wall -Wextra -O2
 LDFLAGS =
 
@@ -9,3 +9,4 @@ tftp.out: hw2.c
 
 clean:
 	rm -f tftp.out *.o
+
