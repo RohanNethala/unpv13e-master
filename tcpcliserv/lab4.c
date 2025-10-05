@@ -22,12 +22,12 @@ int
 main(int argc, char **argv)
 {
     if (argc != 3) err_quit("usage: ./lab4 port# #ofthreads");
-	int					listenfd, connfd;
+	int					listening_fd, connection_fd;
 	pid_t				childpid;
 	socklen_t			clilen;
 	struct sockaddr_in	cliaddr, servaddr;
 
-	listenfd = Socket(AF_INET, SOCK_STREAM, 0);
+	listening_fd = Socket(AF_INET, SOCK_STREAM, 0);
     int num_of_threads = atoi(argv[2]);
 
 	bzero(&servaddr, sizeof(servaddr));
@@ -35,24 +35,37 @@ main(int argc, char **argv)
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
 	servaddr.sin_port        = htons(atoi(argv[1]));
 
-	Bind(listenfd, (SA *) &servaddr, sizeof(servaddr));
+	Bind(listening_fd, (SA *) &servaddr, sizeof(servaddr));
 
-	Listen(listenfd, LISTENQ);
+	Listen(listening_fd, LISTENQ);
 
 	for ( ; ; ) {
 		clilen = sizeof(cliaddr);
-		connfd = Accept(listenfd, (SA *) &cliaddr, &clilen);
+		connection_fd = Accept(listening_fd, (SA *) &cliaddr, &clilen);
 
 		// if ( (childtid = pthread_create()) == 0) {	/* child thread for client */
-		// 	Close(listenfd);	/* close listening socket */
-		// 	str_echo(connfd);	/* process the request */
+		// 	Close(listening_fd);	/* close listening socket */
+		// 	str_echo(connection_fd);	/* process the request */
 		// 	exit(0);
 		// }
 
 		if ( (childpid = Fork()) == 0) {	/* child process */
-            int n= 0 ;
-            int j = scanf("Enter N: %d\n", &n);
-            j = j + 1;
+            Close(listening_fd);
+            int n = 0 ;
+            Write(connection_fd, "Enter N: ", 9);
+            char buffer[128];
+            ssize_t rn = Read(connection_fd, buffer, sizeof(buffer) - 1);
+            if (rn <= 0){
+                Close(connection_fd);
+                exit(0);
+            }
+            buffer[rn] = '\0';
+            int valid = sscanf(buffer, "%d", &n);
+            if (valid != 1 || n <= 0){
+                Write(connection_fd, "This number is invalid\n", 23);
+                Close(connection_fd);
+                exit(0);
+            }
             // int i = 0;
             int num_parallel_processes = n / num_of_threads;
             int sums[num_of_threads];
@@ -86,11 +99,11 @@ main(int argc, char **argv)
                 final_sum = final_sum + sums[i];
             }
             printf("Final Sum: %d\n", final_sum);
-			Close(listenfd);	/* close listening socket */
-			str_echo(connfd);	/* process the request */
+			Close(listening_fd);	/* close listening socket */
+			str_echo(connection_fd);	/* process the request */
 			exit(0);
 		}
-        // if (connfd > 0){
+        // if (connection_fd > 0){
         //     int n;
         //     scanf("Enter N: %d\n", &n);
         //     int i = 0;
@@ -128,6 +141,6 @@ main(int argc, char **argv)
         //     printf("Final Sum: %d\n", final_sum);
 
         // }
-		Close(connfd);			/* parent closes connected socket */
+		Close(connection_fd);			/* parent closes connected socket */
 	}
 }
