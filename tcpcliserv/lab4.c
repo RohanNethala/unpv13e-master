@@ -38,11 +38,13 @@ void *fib_worker(void *argument) {
             o = true;
         }
         if (o == false){
-            arg_fib->sum += fib(i);
-            snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", fib(i), " ");
+            long n = fib(i);
+            arg_fib->sum = arg_fib->sum + n;
+            snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", n, " ");
         } else{
-            arg_fib->sum += fib(i);
-            snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", fib(i), "");
+            long n = fib(i);
+            arg_fib->sum = arg_fib->sum + n;
+            snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", n, "");
         }
     }
     pthread_exit((void *) arg_fib);
@@ -62,7 +64,7 @@ void *client_thread(conn_arg_t *arg) {
     ssize_t rn = Read(arg->connfd, buffer, sizeof(buffer) - 1);
     if (rn <= 0){
         Close(arg->connfd);
-        exit(0);
+        return NULL;
     }
     buffer[rn] = '\0';
     int valid = sscanf(buffer, "%d", &n);
@@ -95,11 +97,12 @@ void *client_thread(conn_arg_t *arg) {
         }
         cur = thread_data[i].end + 1;
         if (rem > 0) {
-            rem--;
+            rem = rem - 1;
             if (rem <= 0) {
                 last = true;
             }
         }
+
         if (pthread_create(&threads[i], NULL, fib_worker, &thread_data[i]) != 0) {
             err_quit("pthread_create error");
         }
@@ -117,15 +120,21 @@ void *client_thread(conn_arg_t *arg) {
         if (td->end >= td->start){
             count = td->end - td->start + 1;
         }
-        total_count += count;
+        total_count = total_count + count;
+        printf("[Client %d][Thread %d] Range [%d-%d]: sum=%ld\n", arg->client_id, td->tid, td->start, td->end, td->sum);
         int written = snprintf(outbuf + outputlength, sizeof(outbuf) - outputlength,
                 "T%d: [%d-%d] -> %s\n",
                 td->tid, td->start, td->end,
                 (td->result[0] ? td->result : ""));
-        if (written > 0) outputlength += written;
-        if (outputlength >= (int)sizeof(outbuf)) break;
+        if (written > 0) {
+            outputlength = outputlength + written;
+        }
+        if (outputlength >= (int)sizeof(outbuf)) {
+            break;
+        }
 
     }
+    printf("[Client %d] Total sum = %ld\n", arg->client_id, final_sum);
     int w2 = snprintf(outbuf + outputlength, sizeof(outbuf) - outputlength,
                         "Total computed = %d Fibonacci numbers\nSum = %ld\n",
                         total_count, final_sum);
@@ -174,8 +183,7 @@ main(int argc, char **argv)
         if (pthread_create(&thread_id, NULL, client_thread, connection_arg) != 0) {
             Close(connection_fd);
             free(connection_arg);
-            continue;   
-
+            continue;
         }
         pthread_detach(thread_id);
 	}
