@@ -43,6 +43,8 @@ typedef struct Job {
     struct Job *next;               // Pointer to the next Job in the queue (linked-list structure)
 } Job;
 
+char usernames[MAX_CLIENTS][MAX_NAME];
+
 /*
  * Thread-safe FIFO queue structure.
  * Used for both job_queue (raw messages from clients)
@@ -95,7 +97,12 @@ void *client_thread(void *varg) {
     }
     buffer[rn] = '\0';
     int valid = sscanf(buffer, "%s", name);
-    printf("[Client %d] Received Name = %s\n", arg->client_id, name);
+    /* Build the greeting into a buffer using snprintf, then write the buffer. */
+    char greetbuf[128];
+    int glen = snprintf(greetbuf, sizeof(greetbuf), "Let's start chatting %s!\n", name);
+    if (glen < 0) glen = 0;
+    if (glen >= (int)sizeof(greetbuf)) glen = (int)sizeof(greetbuf) - 1; /* snprintf truncation */
+    write(arg->connfd, greetbuf, glen);
     close(arg->connfd);
     free(arg);
     return NULL;
