@@ -1,6 +1,5 @@
 #include "unp.h"
 #include <stdbool.h>
-#include <stdbool.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
@@ -34,50 +33,63 @@ void *fib_worker(void *argument) {
     else if (arg_fib->end < 0) return NULL;
     else if (arg_fib->end < arg_fib->start) return NULL;
     for (int i = arg_fib->start; i <= arg_fib->end; i++) {
+        // Edge case for the last number to avoid trailing space
         if (i == arg_fib->end){
             o = true;
         }
         if (o == false){
             long n = fib(i);
             arg_fib->sum = arg_fib->sum + n;
+            // We need to add a space if we're not at the last number
             snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", n, " ");
         } else{
             long n = fib(i);
             arg_fib->sum = arg_fib->sum + n;
+            // Otherwise, we don't add a space
             snprintf(arg_fib->result + strlen(arg_fib->result), sizeof(arg_fib->result) - strlen(arg_fib->result), "%ld%s", n, "");
         }
     }
     pthread_exit((void *) arg_fib);
 }
 
+// This struct is for the client thread arguments
 typedef struct {
     int num_of_threads;
     int connfd;
     int client_id;
     struct sockaddr_in cliaddr;
 } conn_arg_t;
-void *client_thread(conn_arg_t *arg) {
+
+// This function is used for the client threads
+void *client_thread(void *varg) {
+    conn_arg_t *arg = (conn_arg_t *)varg;
     printf("[INFO] new client connected from port %d\n", (arg->cliaddr).sin_port);
     int n = 0 ; 
+    // Here we get the input from the user
     Write(arg->connfd, "Please enter an integer N: \n", 29);
     char buffer[100];
     ssize_t rn = Read(arg->connfd, buffer, sizeof(buffer) - 1);
     if (rn <= 0){
         Close(arg->connfd);
+        free(arg);
         return NULL;
     }
     buffer[rn] = '\0';
     int valid = sscanf(buffer, "%d", &n);
     printf("[Client %d] Received N = %d\n", arg->client_id, n);
+    // Here we do some error checking on the user's input
     if (valid != 1){
         Write(arg->connfd, "This number is invalid\n", 23);
         Close(arg->connfd);
-        exit(0);
+        free(arg);
+        return NULL;
     } else if (n <= 0){
         Write(arg->connfd, "This number is invalid\n", 23);
         Close(arg->connfd);
-        exit(0);
+        free(arg);
+        return NULL;
     }
+    // Now we make the worker threads to compute the Fibonacci sums
     fib_data_t thread_data[arg->num_of_threads];
     pthread_t threads[arg->num_of_threads];
     int base = n / arg->num_of_threads;
@@ -92,6 +104,7 @@ void *client_thread(conn_arg_t *arg) {
         } else {
             thread_data[i].end = cur + base - 1 + (rem > 0 ? 1 : 0);
         }
+        // Here we handle the last number in all the intervals
         if (thread_data[i].end > n) {
             thread_data[i].end = n;
         }
@@ -102,11 +115,12 @@ void *client_thread(conn_arg_t *arg) {
                 last = true;
             }
         }
-
+        // Now we create the thread
         if (pthread_create(&threads[i], NULL, fib_worker, &thread_data[i]) != 0) {
             err_quit("pthread_create error");
         }
     }
+    // Now we compute the sum from joining the threads
     long final_sum = 0;
     int total_count = 0;
     char outbuf[2048];
@@ -120,6 +134,7 @@ void *client_thread(conn_arg_t *arg) {
         if (td->end >= td->start){
             count = td->end - td->start + 1;
         }
+        // Here we keep track of the total count of Fibonacci numbers computed
         total_count = total_count + count;
         printf("[Client %d][Thread %d] Range [%d-%d]: sum=%ld\n", arg->client_id, td->tid, td->start, td->end, td->sum);
         int written = snprintf(outbuf + outputlength, sizeof(outbuf) - outputlength,
@@ -141,6 +156,7 @@ void *client_thread(conn_arg_t *arg) {
     if (w2 > 0) outputlength += w2;
     Writen(arg->connfd, outbuf, outputlength);
     Close(arg->connfd);
+    free(arg);
     return NULL;
 }
 
