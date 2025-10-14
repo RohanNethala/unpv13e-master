@@ -1,9 +1,6 @@
 include ../Make.defines
 
-PROGS =	tcpcli01 tcpcli04 tcpcli05 tcpcli06 \
-		tcpcli07 tcpcli08 tcpcli09 tcpcli10 tcpcli11\
-		tcpserv01 tcpserv02 tcpserv03 tcpserv04 \
-		tcpserv08 tcpserv09 tcpservselect01 tcpservpoll01 tsigpipe lab4
+PROGS =	lab4 chatroom_server
 
 all:	${PROGS}
 
@@ -65,5 +62,12 @@ tsigpipe:	tsigpipe.o
 
 lab4: lab4.o
 		${CC} ${CFLAGS} -o $@ lab4.o ${LIBS}
+
+chatroom_server: chatroom_server.o
+		${CC} ${CFLAGS} -o $@ chatroom_server.o -pthread ${LIBS}
+
+chatroom_server.out: chatroom_server.c
+	clang -Wall -Wextra -O2 -pthread chatroom_server.c -o chatroom_server.out
+
 clean:
 		rm -f ${PROGS} ${CLEANFILES}
