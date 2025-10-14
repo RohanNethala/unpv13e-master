@@ -19,6 +19,19 @@
 #define MAX_MSG      1024
 #define MAX_CLIENTS  64
 #define INBUF        2048
+#define WORKER_MAX   16
+
+typedef struct {
+    size_t outoffset;
+    size_t outputlength;
+    int fd;
+    char name[MAX_NAME];
+    char *outbuf;
+} Client;
+
+Client clients[MAX_CLIENTS];
+int num_clients;
+
 typedef struct Job {
     int sender_fd;                  // The file descriptor (socket) of the client who sent the message
     char username[MAX_NAME];        // Username of the sender
@@ -43,26 +56,70 @@ static Queue job_queue, bcast_queue;
 
 /* ---------------- Queue Utilities ---------------- */
 static void q_init(Queue *q) {
-    //todo
+    q->head = q->tail = NULL;
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->cv, NULL);
+    q->closed = 0;
 }
 static void q_close(Queue *q) {
-    //todo
+    pthread_mutex_lock(&q->mtx);
+    q->closed = true;
+    pthread_cond_broadcast(&q->cv);
+    pthread_mutex_unlock(&q->mtx);
 }
 static void q_push(Queue *q, Job *j) {
-    //todo
+    pthread_mutex_lock(&q->mtx);
+    if (q->closed == false){
+        j->next = NULL;
+        if (q->tail == NULL) {
+            q->tail = j;
+            q->head = q->tail;
+        } else {
+            q->tail->next = j;
+            q->tail = j;
+        }
+        pthread_cond_signal(&q->cv);
+        pthread_mutex_unlock(&q->mtx);
+        return;
+    }
+    pthread_mutex_unlock(&q->mtx);
+    free_job(j);
+    return;
 }
 static Job *q_pop(Queue *q) {
-    //todo
+    pthread_mutex_lock(&q->mtx);
+    while (q->closed == false && q->head == NULL) {
+        pthread_cond_wait(&q->cv, &q->mtx);
+    }
+    if (q->head == NULL && q->closed == true){
+        pthread_mutex_unlock(&q->mtx);
+        return NULL;
+    }
+    Job *j = q->head;
+    q->head = j->next;
+    if (q->head == NULL) {
+        q->tail = NULL;
+    }
+    pthread_mutex_unlock(&q->mtx);
+    return j;
 }
-
+Client clients[MAX_CLIENTS];
+pthread_mutex_t clients_mtx = PTHREAD_MUTEX_INITIALIZER;
+bool running = true;
+pthread_t workers[WORKER_MAX];
+int worker_count = 4;
 /*
  * CSCI 4220 - Assignment 2 Reference Solution
  * Concurrent Chatroom Server (select() + pthread worker pool)
  * Classic IRC-style "/me" action messages: *username text*
 /* ---------------- Main ---------------- */
 int main(int argc, char **argv) {
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        clients[i].fd = -1;
+    }
+    pthread_mutex_init(&clients_mtx, NULL);
     if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: %s [port] [max_clients] (optional num_workers ignored)\n", argv[0]);
+        fprintf(stderr, "usage: %s [port] [num_workers] [max_clients] (optional num_workers ignored)\n", argv[0]);
         fprintf(stderr, "Example: %s 4000 16\n", argv[0]);
         exit(EXIT_FAILURE);
     }
@@ -91,7 +148,15 @@ int main(int argc, char **argv) {
     FD_ZERO(&master_set);
     FD_SET(listening_fd, &master_set);
     int fdmax = listening_fd;
-
+    q_init(&job_queue);
+    // while (true){
+    //     Job *next_job = q_pop(&job_queue);
+    //     if (next_job == NULL){
+    //         break;
+    //     }
+    //     // int output = format(next_job);
+        
+    // }
     while (1) {
         read_fds = master_set;
         select(fdmax + 1, &read_fds, NULL, NULL, NULL) ;
@@ -170,73 +235,6 @@ int main(int argc, char **argv) {
             // }
         }
     }
+    pthread_mutex_destroy(&clients_mtx);
     return 0;
 }
-                // if (fd == listening_fd){
-                //     // Here we get the input from the user
-                //     clilen = sizeof(cliaddr);
-                //     connection_fd = accept(listening_fd, (SA *) &cliaddr, &clilen);
-                //     FD_SET(connection_fd, &master_set);
-                //     if (connection_fd > fdmax) {
-                //         fdmax = connection_fd;
-                //     }
-                //     num_clients = num_clients + 1;
-                //     conn_arg_t *connection_arg = malloc(sizeof(conn_arg_t));
-                //     if (connection_arg == NULL) {
-                //         perror("malloc error");
-                //         close(connection_fd);
-                //         continue;
-                //     }
-                //     // Here we set up all the client thread's arguments
-                //     connection_arg->num_of_threads = atoi(argv[2]);
-                //     connection_arg->connfd = connection_fd;
-                //     connection_arg->cliaddr = cliaddr;
-                //     connection_arg->client_id = num_clients;
-                //     pthread_t thread_id;
-                //     // Now we make the client thread
-                //     if (pthread_create(&thread_id, NULL, client_thread, connection_arg) != 0) {
-                //         close(connection_fd);
-                //         free(connection_arg);
-                //         continue;
-                //     }
-                //     pthread_detach(thread_id);                
-                // } else {
-                //     printf("Penis");
-                // }
-        // // Here we start accepting new connections from clients
-		// clilen = sizeof(cliaddr);
-		// connection_fd = accept(listening_fd, (SA *) &cliaddr, &clilen);
-        // num_clients = num_clients + 1;
-        // conn_arg_t *connection_arg = malloc(sizeof(conn_arg_t));
-        // if (connection_arg == NULL) {
-        //     perror("malloc error");
-        //     close(connection_fd);
-        //     continue;
-        // }
-        // // Here we set up all the client thread's arguments
-        // connection_arg->num_of_threads = atoi(argv[2]);
-        // connection_arg->connfd = connection_fd;
-        // connection_arg->cliaddr = cliaddr;
-        // connection_arg->client_id = num_clients;
-        // pthread_t thread_id;
-        // // Now we make the client thread
-        // if (pthread_create(&thread_id, NULL, client_thread, connection_arg) != 0) {
-        //     close(connection_fd);
-        //     free(connection_arg);
-        //     continue;
-        // }
-        // pthread_detach(thread_id);
-        // conn_arg_t *connection_arg = malloc(sizeof(conn_arg_t));
-        // if (connection_arg == NULL) {
-        //     err_quit("malloc error");
-        //     Close(connection_fd);
-        //     continue;
-        // }
-        // Now we make the client thread
-        // if (pthread_create(&thread_id, NULL, client_thread, connection_arg) != 0) {
-        //     Close(connection_fd);
-        //     free(connection_arg);
-        //     continue;
-        // }
-        // pthread_detach(thread_id);
-    // return 0;
