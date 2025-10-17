@@ -92,16 +92,10 @@ static Job *q_pop(Queue *q) {
     return j;
 }
 
-static void broadcast_to_all(const char *msg, size_t len, int exclude_fd) {
-    pthread_mutex_lock(&clients_mtx);
-    for (int i = 0; i < max_clients_global; ++i) {
-        int fd = client_fds[i];
-        if (fd >= 0 && fd != exclude_fd) {
-            ssize_t n = send(fd, msg, len, 0);
-            (void)n; /* ignore partial write here for simplicity */
-        }
-    }
-    pthread_mutex_unlock(&clients_mtx);
+/* Print a message to the server console (stdout). Clients are input-only in this mode. */
+static void server_print(const char *msg) {
+    fputs(msg, stdout);
+    fflush(stdout);
 }
 
 static void *worker_thread(void *arg) {
@@ -112,19 +106,11 @@ static void *worker_thread(void *arg) {
 
         char out[MAX_NAME + MAX_MSG + 16];
         if (strncmp(j->msg, "/me ", 4) == 0) {
-            int r = snprintf(out, sizeof(out), "*%s %s", j->username, j->msg + 4);
-            if (r < 0) r = 0; size_t outlen = (size_t)r;
-            if (outlen == 0 || out[outlen-1] != '\n') {
-                if (outlen + 1 < sizeof(out)) { out[outlen++] = '\n'; out[outlen] = '\0'; }
-            }
-            broadcast_to_all(out, strlen(out), j->sender_fd);
+            int r = snprintf(out, sizeof(out), "*%s %s\n", j->username, j->msg + 4);
+            if (r >= 0) server_print(out);
         } else {
-            int r = snprintf(out, sizeof(out), "%s: %s", j->username, j->msg);
-            if (r < 0) r = 0; size_t outlen = (size_t)r;
-            if (outlen == 0 || out[outlen-1] != '\n') {
-                if (outlen + 1 < sizeof(out)) { out[outlen++] = '\n'; out[outlen] = '\0'; }
-            }
-            broadcast_to_all(out, strlen(out), j->sender_fd);
+            int r = snprintf(out, sizeof(out), "%s: %s\n", j->username, j->msg);
+            if (r >= 0) server_print(out);
         }
 
         free_job(j);
@@ -230,7 +216,7 @@ int main(int argc, char **argv) {
                 if (n == 0) {
                     if (client_names[i][0] != '\0') {
                         char notify[MAX_NAME + 32]; int rn = snprintf(notify, sizeof(notify), "%s has left the chat.\n", client_names[i]);
-                        if (rn > 0) broadcast_to_all(notify, (size_t)rn, fd);
+                        if (rn > 0) server_print(notify);
                     }
                 } else {
                     perror("recv");
@@ -256,17 +242,45 @@ int main(int argc, char **argv) {
                 char greet[128]; int glen = snprintf(greet, sizeof(greet), "Let's start chatting %s!\n", buf);
                 send(fd, greet, (size_t)glen, 0);
                 char notify[MAX_NAME + 32]; int rn = snprintf(notify, sizeof(notify), "%s has joined the chat.\n", buf);
-                if (rn > 0) broadcast_to_all(notify, (size_t)rn, fd);
+                if (rn > 0) server_print(notify);
                 fprintf(stderr, "[INFO] set name for slot=%d fd=%d name=%s\n", i, fd, buf); fflush(stderr);
             } else {
                 trim_newline(buf);
+
+                /* handle commands locally */
+                if (strcmp(buf, "/quit") == 0) {
+                    /* close the connection */
+                    pthread_mutex_lock(&clients_mtx);
+                    close(fd); FD_CLR(fd, &master_set); client_fds[i] = -1;
+                    char notify[MAX_NAME + 32]; int rn = snprintf(notify, sizeof(notify), "%s has left the chat.\n", client_names[i]);
+                    client_names[i][0] = '\0';
+                    pthread_mutex_unlock(&clients_mtx);
+                    if (rn > 0) server_print(notify);
+                    continue;
+                } else if (strcmp(buf, "/who") == 0) {
+                    /* send list of users back to this fd */
+                    char listbuf[4096]; size_t pos = 0;
+                    pthread_mutex_lock(&clients_mtx);
+                    for (int k = 0; k < max_clients_global; ++k) {
+                        if (client_fds[k] >= 0 && client_names[k][0] != '\0') {
+                            int wn = snprintf(listbuf + pos, sizeof(listbuf) - pos, "%s\n", client_names[k]);
+                            if (wn > 0) pos += (size_t)wn;
+                            if (pos >= sizeof(listbuf) - 64) break;
+                        }
+                    }
+                    pthread_mutex_unlock(&clients_mtx);
+                    if (pos > 0) send(fd, listbuf, pos, 0);
+                    else send(fd, "No users online\n", 16, 0);
+                    continue;
+                }
+
+                /* not a handled command: enqueue for worker to print */
                 Job *job = malloc(sizeof(Job)); if (!job) { perror("malloc job"); continue; }
                 job->sender_fd = fd;
                 pthread_mutex_lock(&clients_mtx);
                 strncpy(job->username, client_names[i], MAX_NAME-1); job->username[MAX_NAME-1] = '\0';
                 pthread_mutex_unlock(&clients_mtx);
                 strncpy(job->msg, buf, MAX_MSG-1); job->msg[MAX_MSG-1] = '\0'; job->next = NULL;
-                fprintf(stderr, "[DEBUG] enqueue from slot=%d fd=%d user=%s msg=%s\n", i, fd, job->username, job->msg); fflush(stderr);
                 q_push(&job_queue, job);
             }
         }
