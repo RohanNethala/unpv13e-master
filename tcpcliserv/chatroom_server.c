@@ -76,7 +76,8 @@ static void q_push(Queue *q, Job *j) {
             q->head = q->tail = j;
         }
         else { 
-            q->tail->next = j; q->tail = j;
+            q->tail->next = j; 
+            q->tail = j;
         }
         pthread_cond_signal(&q->cv);
         pthread_mutex_unlock(&q->mtx);
@@ -163,7 +164,7 @@ static void *broadcaster_thread(void *arg) {
         size_t len = strnlen(b->msg, MAX_MSG);
         // Now we lock the client mutex and send each message
         pthread_mutex_lock(&mtx_for_clients);
-        for (int i = 0; i < max_num_clients_global; ++i) {
+        for (int i = 0; i < max_num_clients_global; i++) {
             int cfd = fds_for_each_client[i];
             if (cfd >= 0 && cfd != b->sender_fd) {
                 send(cfd, b->msg, len, 0);
@@ -202,7 +203,7 @@ int main(int argc, char **argv) {
     }
 
     // Now we set the fds and usernames for each client in max_clients
-    for (int i = 0; i < max_num_clients_global; ++i) {
+    for (int i = 0; i < max_num_clients_global; i++) {
         fds_for_each_client[i] = -1;
         names_of_the_clients[i][0] = '\0';
     }
@@ -216,7 +217,7 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     // Here we create each of the worker threads
-    for (int i = 0; i < worker_count; ++i){
+    for (int i = 0; i < worker_count; i++) {
         pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
     // Here we make the broadcaster thread that will send the messages
@@ -225,11 +226,13 @@ int main(int argc, char **argv) {
     // Now we make the socket, bind to it, and listen and accept connections
     int listening_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listening_fd < 0) {
+        // Here we handle errors for socket()
         perror("error: issue with socket");
         exit(EXIT_FAILURE);
     }
 
     int opt = 1;
+    // Here we set the socket options for reusing the address
     setsockopt(listening_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in servaddr;
@@ -240,10 +243,12 @@ int main(int argc, char **argv) {
 
     int ret = bind(listening_fd, (SA *)&servaddr, sizeof(servaddr));
     if (ret < 0) {
+        // Here we handle errors for bind()
         perror("error: issue with bind"); exit(EXIT_FAILURE);
     }
     int lis = listen(listening_fd, LISTENQ);
     if (lis < 0) {
+        // Here we handle errors for listen()
         perror("error: issue with listen");
         exit(EXIT_FAILURE);
     }
@@ -259,6 +264,7 @@ int main(int argc, char **argv) {
         // Here we see if we got a message for an existing client or have a new client connection with select()
         int rv = select(fdmax + 1, &read_fds, NULL, NULL, NULL);
         if (rv < 0) {
+            // Here we handle errors for select()
             if (errno == EINTR) {
                 continue;
             }
@@ -270,21 +276,25 @@ int main(int argc, char **argv) {
             struct sockaddr_in cliaddr; 
             socklen_t clilen = sizeof(cliaddr);
             int conn = accept(listening_fd, (SA *)&cliaddr, &clilen);
+            // Here we handle errors for accept()
             if (conn < 0) { 
                 perror("error: issue with accept");
             }
             else {
+                // Here we lock the client mutex and find a slot for the new client
                 pthread_mutex_lock(&mtx_for_clients);
                 int slot = -1;
-                for (int i = 0; i < max_num_clients_global; ++i) {
+                for (int i = 0; i < max_num_clients_global; i++) {
                     if (fds_for_each_client[i] < 0) {
                         slot = i;
                         break;
                     }
                 }
+                // Here we handle the case where the server is full
                 if (slot == -1) {
                     send(conn, "Server full. Try later.\n", 25, 0);
                     close(conn);
+                // Otherwise, we add the new client to our arrays and send the welcome message
                 } else {
                     fds_for_each_client[slot] = conn;
                     names_of_the_clients[slot][0] = '\0';
@@ -297,7 +307,9 @@ int main(int argc, char **argv) {
                 pthread_mutex_unlock(&mtx_for_clients);
             }
         }
-        for (int i = 0; i < max_num_clients_global; ++i) {
+        // Here we handle messages from existing clients after processing new connections
+        for (int i = 0; i < max_num_clients_global; i++) {
+            // Now we snapshot the client fd and name under lock so we can use them safely if needed
             int fd;
             char name_snapshot[MAX_NAME];
 
@@ -320,11 +332,12 @@ int main(int argc, char **argv) {
             char buf[INBUF];
             ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
             if (n <= 0) {
-                /* Need to update shared state under lock */
+                // Here we handle when a client leaves the chat
                 pthread_mutex_lock(&mtx_for_clients);
                 if (n == 0) {
                     if (names_of_the_clients[i][0] != '\0') {
                         char notify[MAX_NAME + 32];
+                        // Here we notify other users that this user has left the chat
                         int rn = snprintf(notify, sizeof(notify), "%s has left the chat.\n", names_of_the_clients[i]);
                         if (rn > 0) {
                             Job *b = malloc(sizeof(Job));
@@ -340,6 +353,7 @@ int main(int argc, char **argv) {
                 } else {
                     perror("recv");
                 }
+                // Now we close the client's connection with their fd and clean up their info for the arrays
                 close(fd);
                 FD_CLR(fd, &master_set);
                 fds_for_each_client[i] = -1;
@@ -349,11 +363,11 @@ int main(int argc, char **argv) {
             }
             buf[n] = '\0';
 
-            /* If username not set, treat first line as username. Otherwise push job. */
             pthread_mutex_lock(&mtx_for_clients);
             bool have_name = (names_of_the_clients[i][0] != '\0');
             pthread_mutex_unlock(&mtx_for_clients);
 
+            // Here we check if the user has set their name yet
             if (have_name == false) {
                 char *p = buf + strlen(buf) - 1;
                 while (p >= buf && (*p == '\n' || *p == '\r')) {
@@ -365,7 +379,7 @@ int main(int argc, char **argv) {
                 bool duplicate = false;
                 char *duplicate_name = NULL;
                 pthread_mutex_lock(&mtx_for_clients);
-                for (int k = 0; k < max_num_clients_global; ++k) {
+                for (int k = 0; k < max_num_clients_global; k++) {
                     if (fds_for_each_client[k] >= 0 && names_of_the_clients[k][0] != '\0') {
                         if (strncasecmp(names_of_the_clients[k], buf, MAX_NAME) == 0) {
                             duplicate_name = names_of_the_clients[k];
@@ -379,13 +393,13 @@ int main(int argc, char **argv) {
                     char foundname[MAX_NAME];
                     if (duplicate_name) {
                         size_t ln = strnlen(duplicate_name, MAX_NAME - 1);
-                        for (size_t ci = 0; ci < ln; ++ci) {
+                        for (size_t ci = 0; ci < ln; ci++) {
                             foundname[ci] = (char)tolower((unsigned char)duplicate_name[ci]);
                         }
                         foundname[ln] = '\0';
                     } else {
                         size_t ln = strnlen(buf, MAX_NAME - 1);
-                        for (size_t ci = 0; ci < ln; ++ci) {
+                        for (size_t ci = 0; ci < ln; ci++) {
                             foundname[ci] = (char)tolower((unsigned char)buf[ci]);
                         }
                         foundname[ln] = '\0';
@@ -421,12 +435,13 @@ int main(int argc, char **argv) {
             } else {
                 char *p = buf + strlen(buf) - 1;
                 while (p >= buf && (*p == '\n' || *p == '\r')) {
-                    *p = '\0'; --p;
+                    *p = '\0'; 
+                    p = p - 1;
                 }
 
-                /* handle commands locally */
+                // Here we handle the ./quit and /who commands locally on the server
                 if (strcmp(buf, "/quit") == 0) {
-                    /* close the connection */
+                    // If the user did /quit, we close their connection and inform other users that they left
                     pthread_mutex_lock(&mtx_for_clients);
                     close(fd);
                     FD_CLR(fd, &master_set);
@@ -437,19 +452,21 @@ int main(int argc, char **argv) {
                     pthread_mutex_unlock(&mtx_for_clients);
                     if (rn > 0) {
                         pthread_mutex_lock(&mtx_for_clients);
-                        for (int ii = 0; ii < max_num_clients_global; ++ii) {
-                            int cfd = fds_for_each_client[ii];
-                            if (cfd >= 0 && cfd != fd) send(cfd, notify, (size_t)rn, 0);
+                        for (int j = 0; j < max_num_clients_global; j++) {
+                            int cfd = fds_for_each_client[j];
+                            if (cfd >= 0 && cfd != fd) {
+                                send(cfd, notify, (size_t)rn, 0);
+                            }
                         }
                         pthread_mutex_unlock(&mtx_for_clients);
                     }
                     continue;
                 } else if (strcmp(buf, "/who") == 0) {
-                    /* send list of users back to this fd */
+                    // If the user did /who, we send them the list of connected users
                     char listbuf[4096];
                     size_t pos = 0;
                     pthread_mutex_lock(&mtx_for_clients);
-                    for (int k = 0; k < max_num_clients_global; ++k) {
+                    for (int k = 0; k < max_num_clients_global; k++) {
                         if (fds_for_each_client[k] >= 0 && names_of_the_clients[k][0] != '\0') {
                             int wn = snprintf(listbuf + pos, sizeof(listbuf) - pos, "%s\n", names_of_the_clients[k]);
                             if (wn > 0) {
@@ -464,18 +481,35 @@ int main(int argc, char **argv) {
                     pthread_mutex_unlock(&mtx_for_clients);
                     if (pos > 0) {
                         send(fd, listbuf, pos, 0);
-                    } else {
-                        send(fd, "No users online\n", 16, 0);
-                    }
+                    } 
                     continue;
                 }
 
-                /* not a handled command: enqueue for worker to print */
+                // Here we handle the cases where the user inputs an invalid command
+                if (buf[0] == '/') {
+                    if (!(strncmp(buf, "/me ", 4) == 0)) {
+                        const char *err = "Invalid command. Type /who, /me, or /quit.\n";
+                        send(fd, err, strlen(err), 0);
+                        continue;
+                    }
+                    else if (!(strcmp(buf, "/who") == 0)) {
+                        const char *err = "Invalid command. Type /who, /me, or /quit.\n";
+                        send(fd, err, strlen(err), 0);
+                        continue;
+                    } 
+                    else if (!(strcmp(buf, "/quit") == 0)) {
+                        const char *err = "Invalid command. Type /who, /me, or /quit.\n";
+                        send(fd, err, strlen(err), 0);
+                        continue;
+                    }
+                }
+
                 Job *job = malloc(sizeof(Job)); 
                 if (!job) {
                     perror("malloc job"); 
                     continue;
                 }
+                // Here we create a new job for the message and push it to the job queue
                 job->sender_fd = fd;
                 pthread_mutex_lock(&mtx_for_clients);
                 strncpy(job->username, names_of_the_clients[i], MAX_NAME-1); 
@@ -489,11 +523,11 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Now we clean up the threads and close the queues and listening socket
     q_close(&job_queue);
-    for (int i = 0; i < worker_count; ++i) {
+    for (int i = 0; i < worker_count; i++) {
         pthread_join(workers[i], NULL);
     }
-    /* shutdown broadcaster */
     q_close(&bcast_queue);
     pthread_join(broadcaster, NULL);
     free(workers);
