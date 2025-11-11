@@ -227,32 +227,34 @@ static inline int udp_bind(uint16_t p){
 static void send_dv(router_t* R, const neighbor_t* nb){
     dv_msg_t msg = {0};
     msg.type = MSG_DV;
-    msg.sender_id = R->self_id;
-    msg.num = 0;
+    // sender_id and num must be in network byte order
+    msg.sender_id = htons(R->self_id);
 
-    // Fill the DV message entries
+    // Fill the DV message entries (but keep them in network byte order for wire)
+    uint16_t out_num = 0;
     for (int i = 0; i < R->num_routes; i++) {
         route_entry_t* e = &R->routes[i];
-        msg.e[msg.num].net = e->dest_net;
-        msg.e[msg.num].mask = e->mask;
+        msg.e[out_num].net = e->dest_net; // already NBO from parse_conf
+        msg.e[out_num].mask = e->mask;     // already NBO
 
-        // Split Horizon / Poison Reverse
+        // Split Horizon / Poison Reverse: advertise INF_COST back to the neighbor that is the next_hop
+        uint16_t send_cost = e->cost;
         if (e->next_hop == nb->ip && e->cost != 0)
-            msg.e[msg.num].cost = INF_COST;
-        else
-            msg.e[msg.num].cost = e->cost;
+            send_cost = INF_COST;
 
-        msg.num++;
+        msg.e[out_num].cost = htons(send_cost);
+        out_num++;
     }
+    msg.num = htons(out_num);
 
     // 🟢 Debug print before sending
     struct in_addr ip;
     ip.s_addr = nb->ip;
     printf("[R%u] sending DV to %s:%u with %u entries\n",
-           R->self_id,
-           inet_ntoa(ip),
-           nb->ctrl_port,
-           msg.num);
+        R->self_id,
+        inet_ntoa(ip),
+        nb->ctrl_port,
+        out_num);
 
     // Prepare destination address
     struct sockaddr_in dest = {0};
@@ -260,7 +262,12 @@ static void send_dv(router_t* R, const neighbor_t* nb){
     dest.sin_port = htons(nb->ctrl_port);
     dest.sin_addr.s_addr = nb->ip;
 
-    ssize_t n = sendto(R->sock_ctrl, &msg, sizeof(dv_msg_t), 0,
+    // Send only the header + actual entries (avoid sending the full MAX_DEST-sized struct)
+    size_t hdr_sz = sizeof(msg.type) + sizeof(msg.sender_id) + sizeof(msg.num);
+    size_t entry_sz = sizeof(msg.e[0]);
+    size_t send_len = hdr_sz + (size_t)out_num * entry_sz;
+
+    ssize_t n = sendto(R->sock_ctrl, &msg, send_len, 0,
                        (struct sockaddr*)&dest, sizeof(dest));
 
     // 🟢 Check for errors or success
@@ -301,7 +308,52 @@ static void broadcast_dv(router_t* R){
  * ------------------------------------------------------------------------- */
 static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
     bool changed = false;
-    // TODO: Implement Bellman-Ford update logic
+    // Convert header fields from network byte order
+    uint16_t sender = ntohs(m->sender_id);
+    uint16_t num = ntohs(m->num);
+
+    // For safety, clamp num to MAX_DEST
+    if (num > MAX_DEST) num = MAX_DEST;
+
+    for (uint16_t i = 0; i < num; i++) {
+        uint32_t net = m->e[i].net;   // already NBO
+        uint32_t mask = m->e[i].mask; // already NBO
+        uint16_t adv_cost = ntohs(m->e[i].cost);
+
+        // Compute new cost: cost to neighbor + advertised cost
+        uint32_t new_cost32;
+        if (adv_cost == INF_COST || nb->cost == INF_COST) {
+            new_cost32 = INF_COST;
+        } else {
+            new_cost32 = (uint32_t)nb->cost + (uint32_t)adv_cost;
+            if (new_cost32 > INF_COST) new_cost32 = INF_COST;
+        }
+        uint16_t new_cost = (uint16_t)new_cost32;
+
+        // Find or create route entry
+        route_entry_t* e = rt_find_or_add(R, net, mask);
+        if (!e) continue; // table full; ignore
+
+        // If route was learned via this neighbor
+        if (e->next_hop == nb->ip) {
+            // If cost changed, update (including being poisoned)
+            if (e->cost != new_cost) {
+                e->cost = new_cost;
+                e->last_update = time(NULL);
+                changed = true;
+            }
+        } else {
+            // New route via this neighbor if cheaper
+            if (new_cost < e->cost) {
+                e->next_hop = nb->ip;
+                e->cost = new_cost;
+                e->last_update = time(NULL);
+                changed = true;
+            }
+        }
+    }
+
+    (void)sender; // currently unused, but kept for clarity
     return changed;
 }
 
@@ -363,16 +415,73 @@ int main(int argc, char** argv){
 
         //Neighbor timeout detection
         for(int i=0; i<R.num_neighbors; i++){
-            // TODO: Neighbor timeout detection (use neighbor_t's last_heard)
-            // If timeout is detected, poison all routes learned from this neighbor
-            // Output a log message with log_table(&R, "neighbor-dead");
+            neighbor_t* nb = &R.neighbors[i];
+            if (!nb->alive) continue;
+            if (now - nb->last_heard > DEAD_INTERVAL_SEC) {
+                nb->alive = false;
+                bool changed = false;
+                for (int j = 0; j < R.num_routes; j++) {
+                    route_entry_t* re = &R.routes[j];
+                    if (re->next_hop == nb->ip && re->cost != INF_COST) {
+                        re->cost = INF_COST;
+                        re->last_update = now;
+                        changed = true;
+                    }
+                }
+                if (changed) log_table(&R, "neighbor-dead");
+            }
         }
 
         //Handle control (DV) messages
         if(n > 0 && FD_ISSET(R.sock_ctrl, &rfds)){
-            // TODO: Handle control (DV) messages and call dv_update
-            // If the routing table is changed, output a log message with log_table(&R,"dv-update")
+            struct sockaddr_in from={0};
+            socklen_t flen = sizeof(from);
+            dv_msg_t buf;
+            ssize_t r = recvfrom(R.sock_ctrl, &buf, sizeof(buf), 0,
+                                 (struct sockaddr*)&from, &flen);
+            if (r <= 0) {
+                if (r < 0) perror("recvfrom");
+            } else {
+                // Validate message type
+                if (buf.type != MSG_DV) {
+                    // ignore unknown
+                } else {
+                    // Find neighbor by addr/port
+                    uint32_t src_ip = from.sin_addr.s_addr; // NBO
+                    uint16_t src_port = ntohs(from.sin_port);
+                    // Debug: show actual source seen on socket
+                    {
+                        struct in_addr a; a.s_addr = src_ip;
+                        printf("[R%u] recv DV from %s:%u\n", R.self_id, inet_ntoa(a), src_port);
+                    }
 
+                    neighbor_t* nb = NULL;
+                    for (int k = 0; k < R.num_neighbors; k++) {
+                        if (R.neighbors[k].ip == src_ip && R.neighbors[k].ctrl_port == src_port) {
+                            nb = &R.neighbors[k]; break;
+                        }
+                    }
+                    // Fallback: on loopback the kernel may set source IP to 127.0.0.1
+                    // while configs use 127.0.1.x. If exact ip+port didn't match, try matching by port only.
+                    if (!nb) {
+                        for (int k = 0; k < R.num_neighbors; k++) {
+                            if (R.neighbors[k].ctrl_port == src_port) { nb = &R.neighbors[k]; break; }
+                        }
+                    }
+
+                    if (!nb) {
+                        // Unknown neighbor: ignore the DV
+                        // (This may happen if packet came from unexpected host/port.)
+                    } else {
+                        // Update liveness
+                        nb->last_heard = time(NULL);
+                        nb->alive = true;
+
+                        bool changed = dv_update(&R, nb, &buf);
+                        if (changed) log_table(&R, "dv-update");
+                    }
+                }
+            }
         }
         
         // TODO: Handle data packets
