@@ -226,80 +226,67 @@ static inline int udp_bind(uint16_t p){
  * ------------------------------------------------------------------------- */
 static void send_dv(router_t* R, const neighbor_t* nb){
     dv_msg_t msg = {0};
-    msg.type = MSG_DV;
-    // sender_id and num must be in network byte order
-    msg.sender_id = htons(R->self_id);
-
-    // Fill the DV message entries (but keep them in network byte order for wire)
-    uint16_t out_num = 0;
-    for (int i = 0; i < R->num_routes; i++) {
+    msg.type = 2;
+    int self_id = htons(R->self_id);
+    msg.sender_id = self_id;
+    uint16_t output_number;
+    output_number = 0;
+    int total_number_of_routes;
+    total_number_of_routes = R->num_routes;
+    for (int i = 0; i < total_number_of_routes; i++) {
         route_entry_t* e = &R->routes[i];
-        msg.e[out_num].net = e->dest_net; // already NBO from parse_conf
-        msg.e[out_num].mask = e->mask;     // already NBO
-
-        // Split Horizon / Poison Reverse: advertise INF_COST back to the neighbor that is the next_hop
-        uint16_t send_cost = e->cost;
-        if (e->next_hop == nb->ip && e->cost != 0)
-            send_cost = INF_COST;
-
-        msg.e[out_num].cost = htons(send_cost);
-        out_num++;
+        uint32_t dest_net = e->dest_net;
+        uint32_t mask = e->mask;
+        uint32_t cost = e->cost;
+        msg.e[output_number].net = dest_net;
+        msg.e[output_number].mask = mask;
+        uint16_t send_cost = cost;
+        uint32_t neighbor_ip = nb->ip;
+        uint32_t next_hop = e->next_hop;
+        if (next_hop == neighbor_ip){
+            if (cost != 0){
+                send_cost = INF_COST;
+            }
+        }
+        int network_send_cost = htons(send_cost);
+        msg.e[output_number].cost = network_send_cost;
+        output_number++;
     }
-    msg.num = htons(out_num);
-
-    // 🟢 Debug print before sending
+    msg.num = htons(output_number);
     struct in_addr ip;
-    ip.s_addr = nb->ip;
-    printf("[R%u] sending DV to %s:%u with %u entries\n",
-        R->self_id,
-        inet_ntoa(ip),
-        nb->ctrl_port,
-        out_num);
-
-    // Prepare destination address
+    uint32_t n_ip = nb->ip;
+    uint16_t neighbor_control_port = nb->ctrl_port;
+    ip.s_addr = n_ip;
     struct sockaddr_in dest = {0};
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(nb->ctrl_port);
-    dest.sin_addr.s_addr = nb->ip;
-
-    // Send only the header + actual entries (avoid sending the full MAX_DEST-sized struct)
+    dest.sin_port = htons(neighbor_control_port);
+    dest.sin_addr.s_addr = n_ip;
     size_t hdr_sz = sizeof(msg.type) + sizeof(msg.sender_id) + sizeof(msg.num);
     size_t entry_sz = sizeof(msg.e[0]);
-    size_t send_len = hdr_sz + (size_t)out_num * entry_sz;
-
-    ssize_t n = sendto(R->sock_ctrl, &msg, send_len, 0,
-                       (struct sockaddr*)&dest, sizeof(dest));
-
-    // 🟢 Check for errors or success
-    if (n < 0)
+    size_t send_len = hdr_sz + (size_t)output_number * entry_sz;
+    ssize_t n = sendto(R->sock_ctrl, &msg, send_len, 0, (struct sockaddr*)&dest, sizeof(dest));
+    if (n < 0) {
         perror("sendto error");
-    else
-        printf("[R%u] DV sent successfully (%zd bytes)\n", R->self_id, n);
+    }
 }
-
 /* -------------------------------------------------------------------------
  * TODO #2: Broadcast DV updates to all alive neighbors
  * ------------------------------------------------------------------------- */
 static void broadcast_dv(router_t* R){
     // TODO: Loop over neighbors and call send_dv() for each alive neighbor
-    for (int i = 0; i < R->num_neighbors; i++) {
+    int total_number_of_neighbors = R->num_neighbors;
+    for (int i = 0; i < total_number_of_neighbors; i++) {
         neighbor_t* nb = &R->neighbors[i];
-
-        if (!nb->alive) continue;
-
-        // 🟢 Debug print to confirm broadcast is working
+        if (nb->alive == false) {
+            continue;
+        }
         struct in_addr ip;
         ip.s_addr = nb->ip;
-        printf("[R%u] broadcasting DV to neighbor %s:%u (cost=%u)\n",
-               R->self_id,
-               inet_ntoa(ip),
-               nb->ctrl_port,
-               nb->cost);
-
+        uint16_t neighbor_control_port = nb->ctrl_port;
+        uint16_t neighbor_cost = nb->cost;
         send_dv(R, nb);
     }
 }
-
 /* -------------------------------------------------------------------------
  * TODO #3: Apply Bellman-Ford update rule
  *    - For each entry in received DV:
@@ -308,43 +295,65 @@ static void broadcast_dv(router_t* R){
  * ------------------------------------------------------------------------- */
 static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
     bool changed = false;
-    // Convert header fields from network byte order
-    uint16_t sender = ntohs(m->sender_id);
-    uint16_t num = ntohs(m->num);
-
-    // For safety, clamp num to MAX_DEST
-    if (num > MAX_DEST) num = MAX_DEST;
-
-    for (uint16_t i = 0; i < num; i++) {
-        uint32_t net = m->e[i].net;   // already NBO
-        uint32_t mask = m->e[i].mask; // already NBO
+    uint16_t message_sender = ntohs(m->sender_id);
+    uint16_t message_number = ntohs(m->num);
+    if (message_number > MAX_DEST) {
+        message_number = MAX_DEST;
+    }
+    for (uint16_t i = 0; i < message_number; i++) {
+        uint32_t net = m->e[i].net;
+        uint32_t mask = m->e[i].mask;
         uint16_t adv_cost = ntohs(m->e[i].cost);
-
-        // Compute new cost: cost to neighbor + advertised cost
         uint32_t new_cost32;
-        if (adv_cost == INF_COST || nb->cost == INF_COST) {
+        if (adv_cost == INF_COST){
+            new_cost32 = INF_COST;
+        } else if (nb->cost == INF_COST) {
             new_cost32 = INF_COST;
         } else {
             new_cost32 = (uint32_t)nb->cost + (uint32_t)adv_cost;
-            if (new_cost32 > INF_COST) new_cost32 = INF_COST;
+            if (new_cost32 > INF_COST) {
+                new_cost32 = INF_COST;
+            }
         }
         uint16_t new_cost = (uint16_t)new_cost32;
-
-        // Find or create route entry
         route_entry_t* e = rt_find_or_add(R, net, mask);
-        if (!e) continue; // table full; ignore
+        if (!e) {
+            continue;
+        }
 
-        // If route was learned via this neighbor
+
         if (e->next_hop == nb->ip) {
-            // If cost changed, update (including being poisoned)
             if (e->cost != new_cost) {
+                struct in_addr dbg_net;
+                struct in_addr dbg_mask;
+                struct in_addr dbg_nb;
+                dbg_net.s_addr = e->dest_net;
+                dbg_mask.s_addr = e->mask;
+                dbg_nb.s_addr = nb->ip;
+                char s_net[64];
+                char s_mask[64];
+                char s_nb[64];
+                strncpy(s_net, inet_ntoa(dbg_net), sizeof(s_net)); s_net[sizeof(s_net)-1]=0;
+                strncpy(s_mask, inet_ntoa(dbg_mask), sizeof(s_mask)); s_mask[sizeof(s_mask)-1]=0;
+                strncpy(s_nb, inet_ntoa(dbg_nb), sizeof(s_nb)); s_nb[sizeof(s_nb)-1]=0;
                 e->cost = new_cost;
                 e->last_update = time(NULL);
                 changed = true;
             }
         } else {
-            // New route via this neighbor if cheaper
             if (new_cost < e->cost) {
+                struct in_addr dbg_net;
+                struct in_addr dbg_mask;
+                struct in_addr dbg_nb;
+                dbg_net.s_addr = e->dest_net;
+                dbg_mask.s_addr = e->mask;
+                dbg_nb.s_addr = nb->ip;
+                char s_net[64];
+                char s_mask[64];
+                char s_nb[64];
+                strncpy(s_net, inet_ntoa(dbg_net), sizeof(s_net)); s_net[sizeof(s_net)-1]=0;
+                strncpy(s_mask, inet_ntoa(dbg_mask), sizeof(s_mask)); s_mask[sizeof(s_mask)-1]=0;
+                strncpy(s_nb, inet_ntoa(dbg_nb), sizeof(s_nb)); s_nb[sizeof(s_nb)-1]=0;
                 e->next_hop = nb->ip;
                 e->cost = new_cost;
                 e->last_update = time(NULL);
@@ -352,8 +361,7 @@ static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
             }
         }
     }
-
-    (void)sender; // currently unused, but kept for clarity
+    (void)message_sender; // currently unused, but kept for clarity
     return changed;
 }
 
@@ -364,7 +372,113 @@ static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
  *    - Forward via UDP or deliver locally if directly connected
  * ------------------------------------------------------------------------- */
 static void forward_data(router_t* R, const data_msg_t* in){
-    // TODO: Implement packet forwarding using LPM
+    uint32_t destination_ip_address = in->dst_ip;
+    uint8_t ttl = in->ttl;
+    struct in_addr src_addr;
+    struct in_addr dst_addr;
+    char src_str[32];
+    char dst_str[32];
+    src_addr.s_addr = in->src_ip;
+    dst_addr.s_addr = destination_ip_address;
+    snprintf(src_str, sizeof(src_str), "%s", inet_ntoa(src_addr));
+    snprintf(dst_str, sizeof(dst_str), "%s", inet_ntoa(dst_addr));
+    bool is_local = false;
+    int total_routes = R->num_routes;
+    for (int i = 0; i < total_routes; i++) {
+        route_entry_t* e = &R->routes[i];
+        uint32_t next_hop = e->next_hop;
+        if (next_hop == 0){
+            uint32_t mask = e->mask;
+            uint32_t dest_net = e->dest_net;
+
+            if ((destination_ip_address & mask) == (dest_net & mask)) {
+                is_local = true;
+                break;
+            }
+        }
+    }
+
+    if (is_local == true) {
+        return;
+    }
+    if (ttl == 0) {
+        printf("[R%u] DROP ttl=0\n", R->self_id);
+        return;
+    }
+    route_entry_t* route = rt_lookup(R, destination_ip_address);
+    if (!route) {
+        return;
+    }
+    if (route->cost == INF_COST) {
+        struct in_addr nh;
+        nh.s_addr = route->next_hop;
+        return;
+    }
+    uint32_t next_hop_ip;
+    if (route->next_hop != 0) {
+        next_hop_ip = route->next_hop;
+    } else {
+        next_hop_ip = destination_ip_address;
+    }
+
+
+    bool next_hop_alive = true;
+    if (route->next_hop != 0) {
+        next_hop_alive = false;
+        for (int i = 0; i < R->num_neighbors; i++) {
+            if (R->neighbors[i].ip == route->next_hop && R->neighbors[i].alive) {
+                next_hop_alive = true;
+                break;
+            }
+        }
+    }
+    if (route->next_hop != 0 && !next_hop_alive) {
+        struct in_addr nh;
+        nh.s_addr = route->next_hop;
+        return;
+    }
+    uint8_t new_ttl = ttl - 1;
+    data_msg_t out_pkt = *in;
+    out_pkt.ttl = new_ttl;
+
+    
+    uint16_t dest_port;
+    uint32_t dest_udp_ip;
+
+    if (route->next_hop != 0) {
+        dest_udp_ip = route->next_hop;
+        uint16_t neighbor_ctrl_port = 0;
+        for (int i = 0; i < R->num_neighbors; i++) {
+            if (R->neighbors[i].ip == route->next_hop) {
+                neighbor_ctrl_port = R->neighbors[i].ctrl_port;
+                break;
+            }
+        }
+        dest_port = get_data_port(neighbor_ctrl_port);
+    } else {
+        return;
+    }
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    int network_dest_port = htons(dest_port);
+    dest.sin_port = network_dest_port;
+    dest.sin_addr.s_addr = dest_udp_ip;
+    size_t pkt_len = sizeof(data_msg_t);
+    ssize_t n = sendto(R->sock_data, &out_pkt, pkt_len,0,(struct sockaddr*)&dest, sizeof(dest));
+
+    if (n < 0) {
+        perror("sendto data");
+        return;
+    }
+
+    struct in_addr mask_addr;
+    struct in_addr nh_addr;
+    char nh_str[32], mask_str[32];
+    mask_addr.s_addr = route->mask;
+    nh_addr.s_addr = route->next_hop;
+    snprintf(nh_str, sizeof(nh_str), "%s", inet_ntoa(nh_addr));
+    snprintf(mask_str, sizeof(mask_str), "%s", inet_ntoa(mask_addr));
+    printf("[R%u] FWD dst=%s via next_hop=%s mask=%s cost=%u ttl=%u\n",R->self_id,dst_str,nh_str, mask_str, route->cost, new_ttl);
 }
 
 /* -------------------------------------------------------------------------
@@ -423,6 +537,16 @@ int main(int argc, char** argv){
                 for (int j = 0; j < R.num_routes; j++) {
                     route_entry_t* re = &R.routes[j];
                     if (re->next_hop == nb->ip && re->cost != INF_COST) {
+                        /* Debug: print which route is being poisoned */
+                        struct in_addr dbg_net, dbg_mask, dbg_nh;
+                        dbg_net.s_addr = re->dest_net;
+                        dbg_mask.s_addr = re->mask;
+                        dbg_nh.s_addr = nb->ip;
+                        char s_net[64], s_mask[64], s_nh[64];
+                        strncpy(s_net, inet_ntoa(dbg_net), sizeof(s_net)); s_net[sizeof(s_net)-1]=0;
+                        strncpy(s_mask, inet_ntoa(dbg_mask), sizeof(s_mask)); s_mask[sizeof(s_mask)-1]=0;
+                        strncpy(s_nh, inet_ntoa(dbg_nh), sizeof(s_nh)); s_nh[sizeof(s_nh)-1]=0;
+
                         re->cost = INF_COST;
                         re->last_update = now;
                         changed = true;
@@ -452,7 +576,6 @@ int main(int argc, char** argv){
                     // Debug: show actual source seen on socket
                     {
                         struct in_addr a; a.s_addr = src_ip;
-                        printf("[R%u] recv DV from %s:%u\n", R.self_id, inet_ntoa(a), src_port);
                     }
 
                     neighbor_t* nb = NULL;
@@ -484,9 +607,23 @@ int main(int argc, char** argv){
             }
         }
         
-        // TODO: Handle data packets
+        // Handle data packets
         if(n > 0 && FD_ISSET(R.sock_data, &rfds)){
-            // TODO: Handle data packets and call forward_data
+            struct sockaddr_in from={0};
+            socklen_t flen = sizeof(from);
+            data_msg_t pkt;
+            ssize_t r = recvfrom(R.sock_data, &pkt, sizeof(pkt), 0,
+                                 (struct sockaddr*)&from, &flen);
+            if (r <= 0) {
+                if (r < 0) perror("recvfrom data");
+            } else {
+                // Validate message type
+                if (pkt.type != MSG_DATA) {
+                    // ignore unknown message types
+                } else {
+                    forward_data(&R, &pkt);
+                }
+            }
         }
     }
 
