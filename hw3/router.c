@@ -335,83 +335,99 @@ static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
 static void forward_data(router_t* R, const data_msg_t* in){
     uint32_t destination_ip_address = in->dst_ip;
     uint8_t ttl = in->ttl;
-    struct in_addr src_addr, dst_addr;
-    char src_str[32], dst_str[32];
-    src_addr.s_addr = in->src_ip;
-    dst_addr.s_addr = destination_ip_address;
-    snprintf(src_str, sizeof(src_str), "%s", inet_ntoa(src_addr));
-    snprintf(dst_str, sizeof(dst_str), "%s", inet_ntoa(dst_addr));
+    char dst_str[32];
+    ipstr(destination_ip_address, dst_str, sizeof(dst_str));
+    
+    // Check if destination is local (directly connected network where we are the destination)
+    bool is_local = false;
+    for (int i = 0; i < R->num_routes; i++) {
+        route_entry_t* e = &R->routes[i];
+        if (e->next_hop == 0) {  // directly connected
+            if ((destination_ip_address & e->mask) == (e->dest_net & e->mask)) {
+                is_local = true;
+                break;
+            }
+        }
+    }
 
-    // Check TTL BEFORE decrementing
+    if (is_local) {
+        char src_str[32];
+        ipstr(in->src_ip, src_str, sizeof(src_str));
+        printf("[R%u] DELIVER self src=%s ttl=%u payload=\"%s\"\n",
+               R->self_id, src_str, ttl, in->payload);
+        return;
+    }
+    
+    // Check TTL=0 BEFORE forwarding attempt
     if (ttl == 0) {
         printf("[R%u] DROP ttl=0\n", R->self_id);
         return;
     }
-
-    // Perform LPM lookup
+    
+    // Lookup route
     route_entry_t* route = rt_lookup(R, destination_ip_address);
     if (!route) {
         printf("[R%u] NO MATCH dst=%s\n", R->self_id, dst_str);
         return;
     }
-
-    // Check if local (next_hop == 0)
-    if (route->next_hop == 0) {
-        printf("[R%u] DELIVER self src=%s ttl=%u payload=\"%s\"\n",
-               R->self_id, src_str, ttl, in->payload);
-        return;
-    }
-
-    // Check if route is poisoned
+    
     if (route->cost == INF_COST) {
-        struct in_addr nh;
-        nh.s_addr = route->next_hop;
-        printf("[R%u] NEXT HOP DOWN %s\n", R->self_id, inet_ntoa(nh));
+        char nh_str[32];
+        ipstr(route->next_hop, nh_str, sizeof(nh_str));
+        printf("[R%u] NEXT HOP DOWN %s\n", R->self_id, nh_str);
         return;
     }
-
+    
+    // Determine next hop IP
+    if (route->next_hop == 0) {
+        // Directly connected - deliver
+        printf("[R%u] DELIVER connected dst=%s payload=\"%s\"\n", 
+               R->self_id, dst_str, in->payload);
+        return;
+    }
+    
     // Check if next hop is alive
     bool next_hop_alive = false;
-    for (int i = 0; i < R->num_neighbors; i++) {
-        if (R->neighbors[i].ip == route->next_hop && R->neighbors[i].alive) {
-            next_hop_alive = true;
-            break;
-        }
-    }
-    if (!next_hop_alive) {
-        struct in_addr nh;
-        nh.s_addr = route->next_hop;
-        printf("[R%u] NEXT HOP DOWN %s\n", R->self_id, inet_ntoa(nh));
-        return;
-    }
-
-    // Decrement TTL
-    uint8_t new_ttl = ttl - 1;
-    data_msg_t out_pkt = *in;
-    out_pkt.ttl = new_ttl;
-
-    // Find neighbor's control port
     uint16_t neighbor_ctrl_port = 0;
     for (int i = 0; i < R->num_neighbors; i++) {
         if (R->neighbors[i].ip == route->next_hop) {
+            if (R->neighbors[i].alive) {
+                next_hop_alive = true;
+            }
             neighbor_ctrl_port = R->neighbors[i].ctrl_port;
             break;
         }
     }
+    
+    if (!next_hop_alive) {
+        char nh_str[32];
+        ipstr(route->next_hop, nh_str, sizeof(nh_str));
+        printf("[R%u] NEXT HOP DOWN %s\n", R->self_id, nh_str);
+        return;
+    }
+    
+    // Decrement TTL
+    uint8_t new_ttl = ttl - 1;
+    
+    // Print FWD log with NEW (decremented) TTL
+    char via_str[32];
+    ipstr(route->next_hop, via_str, sizeof(via_str));
+    printf("[R%u] FWD dst=%s via=%s cost=%u ttl=%u\n",
+           R->self_id, dst_str, via_str, route->cost, new_ttl);
+    
+    // Send packet with decremented TTL
+    data_msg_t out_pkt = *in;
+    out_pkt.ttl = new_ttl;
+    
     uint16_t dest_port = get_data_port(neighbor_ctrl_port);
-
-    // Send packet
+    
     struct sockaddr_in dest = {0};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(dest_port);
     dest.sin_addr.s_addr = route->next_hop;
-
-    sendto(R->sock_data, &out_pkt, sizeof(data_msg_t), 0,
+    
+    sendto(R->sock_data, &out_pkt, sizeof(data_msg_t), 0, 
            (struct sockaddr*)&dest, sizeof(dest));
-
-    // Print FWD with destination IP in via field
-    printf("[R%u] FWD dst=%s via=%s cost=%u ttl=%u\n",
-           R->self_id, dst_str, dst_str, route->cost, new_ttl);
 }
 
 /* -------------------------------------------------------------------------
