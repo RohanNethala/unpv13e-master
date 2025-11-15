@@ -234,11 +234,11 @@ static inline const char* ipstr(uint32_t nbo, char* buf, size_t n){
 // -----------------------------------------------------------------------------
 static inline void log_table(router_t* r, const char* why){
     printf("[R%u] ROUTES (%s):\n", r->self_id, why);
-    printf("  %-15s %-15s %-15s %-5s\n", "network", "mask", "next_hop", "cost");
+    printf(" %-15s %-15s %-15s %-5s\n", "network", "mask", "next_hop", "cost");
 
     for (int i = 0; i < r->num_routes; i++) {
         char n1[32], n2[32], n3[32];
-        printf("  %-15s %-15s %-15s %-5u\n",
+        printf(" %-15s %-15s %-15s %-5u\n",
                ipstr(r->routes[i].dest_net, n1, sizeof(n1)),
                ipstr(r->routes[i].mask, n2, sizeof(n2)),
                ipstr(r->routes[i].next_hop, n3, sizeof(n3)),
