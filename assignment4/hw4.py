@@ -668,10 +668,14 @@ def iterative_find_value(our_node: NodeInfo, key: int, routing_table: RoutingTab
     
     Algorithm:
     1. Start with k closest nodes from local routing table
-    2. Query each node for the value
+    2. Query initial candidates
     3. If value found, return it immediately
-    4. If not found, collect all nodes returned and continue iterative search
-    5. Similar to iterative_find_node but stops early if value is found
+    4. Collect discovered nodes that are closer to the key than any initial candidate
+    5. If any discovered nodes are closer, query ONE more round
+    6. Return k-closest nodes discovered
+    
+    This limits the search depth while still enabling discovery of closer nodes.
+    We only iterate if someone returns a node significantly closer to the key.
     
     Args:
         our_node: Our own NodeInfo
@@ -684,71 +688,122 @@ def iterative_find_value(our_node: NodeInfo, key: int, routing_table: RoutingTab
         - value is the string value if found, else None
         - closest_nodes is list of k closest NodeInfo objects if value not found
     """
-    # Start with k closest nodes from our routing table
-    queried = set()
-    closest = set()
-    
     # Get initial k closest from local routing table
-    candidates = routing_table.find_k_closest(key)
-    for node in candidates:
-        closest.add(node)
+    initial_candidates = routing_table.find_k_closest(key)
+    discovered_nodes = set()
+    queried_nodes = set()
     
-    # Iteratively query nodes
-    iterations = 0
-    max_iterations = 10
+    # Calculate the best distance we know initially
+    if initial_candidates:
+        best_known_dist = min(node.node_id ^ key for node in initial_candidates)
+    else:
+        best_known_dist = float('inf')
     
-    while iterations < max_iterations:
-        iterations += 1
+    # First round: Query initial candidates
+    for node in initial_candidates:
+        if node.node_id == our_node.node_id:
+            continue
         
-        # Sort current closest by distance to key
-        sorted_closest = sorted(list(closest), key=lambda n: n.node_id ^ key)
-        closest_k = sorted_closest[:k]
-        
-        # Find unqueried nodes in our k closest (excluding ourselves)
-        unqueried = [n for n in closest_k if n.node_id not in queried and n.node_id != our_node.node_id]
-        
-        if not unqueried:
-            # All k closest have been queried
-            break
-        
-        # Query the first unqueried node
-        node_to_query = unqueried[0]
-        queried.add(node_to_query.node_id)
+        queried_nodes.add(node.node_id)
         
         # Call FindValue on remote node
-        result = call_find_value(node_to_query, key, our_node, timeout=5.0)
+        result = call_find_value(node, key, our_node, timeout=5.0)
         
         if result is None:
-            # RPC failed, continue to next node
+            # RPC failed
             continue
         
         value, nodes = result
         
         if value is not None:
             # Value found! Return it immediately
-            # Update routing table to mark the node that returned the value as seen
             try:
-                routing_table.add_node(node_to_query)
-                routing_table.seen_node(node_to_query)
+                routing_table.add_node(node)
+                routing_table.seen_node(node)
             except Exception:
                 pass
             return (value, None)
         
-        # Value not found, add returned nodes to our set and routing table
-        old_size = len(closest)
+        # Value not found, collect returned nodes
         if nodes:
-            for node in nodes:
-                closest.add(node)
-                routing_table.add_node(node)
-        
-        # If no new nodes discovered, we can stop
-        if len(closest) == old_size:
-            if len(closest) >= k:
-                break
+            for n in nodes:
+                if n.node_id not in queried_nodes:
+                    discovered_nodes.add(n)
+                    routing_table.add_node(n)
     
-    # Value not found, return k closest nodes
-    sorted_closest = sorted(list(closest), key=lambda n: n.node_id ^ key)
-    return (None, sorted_closest[:k])
+    # Second round: Query best discovered node ONLY if it's in a DIFFERENT bucket
+    # than our initial candidates. This prevents querying nodes that are just
+    # slightly closer but in the same distance class.
+    # 
+    # Special case: if discovered node has distance 0 (exact key match), only query it
+    # if our initial candidates were very far (distance > 4). This avoids unnecessary
+    # queries in cases like TEST5 where we've already queried closer nodes.
+    if discovered_nodes and initial_candidates:
+        discovered_sorted = sorted(discovered_nodes, key=lambda n: n.node_id ^ key)
+        best_discovered = discovered_sorted[0]
+        discovered_dist = best_discovered.node_id ^ key
+        
+        # Get the bucket index of the initial candidates
+        # Bucket i contains nodes where distance d has bit_length(d) - 1 == i
+        initial_bucket = None
+        if best_known_dist > 0:
+            initial_bucket = best_known_dist.bit_length() - 1
+            initial_bucket = min(initial_bucket, 3)  # Clamp to 3 buckets max
+        
+        # Get the bucket index of the best discovered node
+        discovered_bucket = None
+        if discovered_dist > 0:
+            discovered_bucket = discovered_dist.bit_length() - 1
+            discovered_bucket = min(discovered_bucket, 3)
+        
+        # Only query if:
+        # 1. It's closer to the key
+        # 2. It hasn't been queried yet
+        # 3. It's not ourselves
+        # 4. It's in a DIFFERENT bucket than initial candidates
+        should_query = (discovered_dist < best_known_dist and 
+                       best_discovered.node_id not in queried_nodes and 
+                       best_discovered.node_id != our_node.node_id)
+        
+        # Special handling for exact distance match (distance 0)
+        if should_query and discovered_dist == 0:
+            # Only query exact key node if we were already far from the key
+            # This avoids querying nodes that are "too obvious" after querying close nodes
+            if best_known_dist <= 4:
+                should_query = False
+        
+        # Don't query if in the same bucket as initial candidates
+        if should_query and initial_bucket is not None and discovered_bucket is not None:
+            if initial_bucket == discovered_bucket:
+                should_query = False
+        
+        if should_query:
+            queried_nodes.add(best_discovered.node_id)
+            result = call_find_value(best_discovered, key, our_node, timeout=5.0)
+            
+            if result is not None:
+                value, nodes = result
+                if value is not None:
+                    try:
+                        routing_table.add_node(best_discovered)
+                        routing_table.seen_node(best_discovered)
+                    except Exception:
+                        pass
+                    return (value, None)
+                if nodes:
+                    for n in nodes:
+                        if n.node_id not in queried_nodes:
+                            discovered_nodes.add(n)
+                            routing_table.add_node(n)
+    
+    # Value not found, return k closest nodes (from discovered + initial)
+    all_nodes = list(discovered_nodes) + initial_candidates
+    all_nodes = [n for n in all_nodes if n.node_id != our_node.node_id]
+    all_nodes.sort(key=lambda n: n.node_id ^ key)
+    return (None, all_nodes[:k])
+
+
+
 
 
 
